@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# setup-wg-easy.sh —— 在全新的 Debian/Ubuntu 云服务器上一键部署 wg-easy (v15)
+# setup-wg-easy.sh —— 在云服务器上一键部署 wg-easy (v15)
 #
 # 目标架构:
 #   客户端 --(IPv6 / UDP 自定义端口)--> 服务器 --(IPv4 出口)--> Internet
@@ -8,47 +8,40 @@
 #
 # 用法 (root 身份运行,例如先 sudo -i):
 #   bash setup-wg-easy.sh --host vpn.example.com --port 52116
-#   bash setup-wg-easy.sh                  # 不带参数:自动探测 IPv6,端口用 52116
-#
-# 通过管道运行时,参数要写成 bash -s -- <参数>:
-#   curl -fsSL <raw-url> | bash -s -- --host vpn.example.com
+#   bash setup-wg-easy.sh            # 不带参数:自动探测 IPv6,端口用 52116
 #
 # 选项 (也可用同名环境变量传入,见下方默认值):
-#   --host <域名或IP>    客户端连接的地址 (IPv6 字面量无需加方括号)
-#   --port <UDP端口>     WireGuard 对外端口 (默认: 52116;必须与云安全组放行的端口一致)
-#   --user <用户名>      面板管理员用户名 (默认: admin)
-#   --password <密码>    面板管理员密码 (默认: admin;不建议用命令行传,会留在历史记录里)
-#                        只允许字母数字和 . _ @ % + = : , -,至少 12 位
-#   --dns <DNS>          下发给客户端的 DNS (默认: 1.1.1.1)
-#   --ipv4-cidr <网段>   隧道 IPv4 网段 (默认: 10.8.0.0/24)
-#   --docker-mirror <Aliyun|AzureChinaCloud>
-#                        安装 Docker 时使用的国内镜像源 (默认: 官方源)
-#   --harden-ssh         禁用 SSH 密码登录 (当前登录用户必须已配置公钥,否则会把自己锁在外面)
-#   -h, --help           显示本帮助
+#   --host <域名或IP>   客户端连接的地址 (IPv6 字面量无需加方括号)
+#   --port <UDP端口>    WireGuard 对外端口 (默认: 52116;必须与你在云安全组放行的端口一致)
+#   --user <用户名>     面板管理员用户名 (默认: admin)
+#   --password <密码>   面板管理员密码 (默认: 123456789123;建议部署后立即修改,
+#                       也不建议用命令行传,会留在历史记录里)
+#   --dns <DNS>         下发给客户端的 DNS (默认: 1.1.1.1)
+#   --ipv4-cidr <网段>  隧道 IPv4 网段 (默认: 10.8.0.0/24)
+#   --harden-ssh        禁用 SSH 密码登录 (需要当前登录用户已配置公钥)
+#                       (默认不改;IPv6 入站 UDP 测试不通时再用)
+#   --reinstall         检测到已有部署时不再询问,直接删除并重装 (非交互环境必须加)
+#   -h, --help          显示本帮助
 # =============================================================================
-
 set -euo pipefail
-umask 077   # 之后创建的 compose / 凭据文件默认只有 root 可读
 
 # ----------------------------- 可调参数 --------------------------------------
 INSTALL_DIR="/etc/docker/containers/wg-easy"
 COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
-IMAGE="${IMAGE:-ghcr.io/wg-easy/wg-easy:15}"
+IMAGE="ghcr.io/wg-easy/wg-easy:15"
 WEB_PORT=51821
-DOCKER_SUBNET="10.42.42.0/24"   # wg-easy 容器自己的 Docker 网络
-DOCKER_IP="10.42.42.42"
 
 WG_HOST="${WG_HOST:-}"
 WG_PORT="${WG_PORT:-52116}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-}"
+ADMIN_PASS="${ADMIN_PASS:-123456789123}"
 WG_DNS="${WG_DNS:-1.1.1.1}"
 WG_IPV4_CIDR="${WG_IPV4_CIDR:-10.8.0.0/24}"
 WG_IPV6_CIDR="${WG_IPV6_CIDR:-fd42:42:42::/64}"   # wg-easy 要求与 IPv4 网段成对设置
 WG_ALLOWED_IPS="${WG_ALLOWED_IPS:-0.0.0.0/0}"     # 只接管 IPv4,不含 ::/0
-DOCKER_MIRROR="${DOCKER_MIRROR:-}"
 DO_HARDEN_SSH=0
-DEPLOY_STARTED=0
+FORCE_REINSTALL=0
+CRED_FILE="/root/wg-easy-credentials.txt"
 
 # ----------------------------- 工具函数 --------------------------------------
 log()  { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
@@ -56,53 +49,36 @@ warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  cat <<'USAGE_END'
-用法: bash setup-wg-easy.sh [选项]
-      curl -fsSL <raw-url> | bash -s -- [选项]
+  cat <<'EOF'
+用法 (root 身份运行):
+  bash setup-wg-easy.sh --host vpn.example.com --port 52116
+  bash setup-wg-easy.sh            # 自动探测 IPv6,端口 52116
 
-  --host <域名或IP>    客户端连接的地址 (IPv6 字面量无需加方括号)
-  --port <UDP端口>     WireGuard 对外端口 (默认: 52116)
-  --user <用户名>      面板管理员用户名 (默认: admin)
-  --password <密码>    面板管理员密码 (默认: admin;自定义时至少 12 位,
-                       只允许字母数字和 . _ @ % + = : , -)
-  --dns <DNS>          下发给客户端的 DNS (默认: 1.1.1.1)
-  --ipv4-cidr <网段>   隧道 IPv4 网段 (默认: 10.8.0.0/24)
-  --docker-mirror <Aliyun|AzureChinaCloud>
-                       安装 Docker 时使用的国内镜像源
-  --harden-ssh         禁用 SSH 密码登录 (需要当前登录用户已配置公钥)
-  -h, --help           显示本帮助
-USAGE_END
+选项 (也可用同名环境变量传入):
+  --host <域名或IP>   客户端连接的地址 (IPv6 字面量无需加方括号)
+  --port <UDP端口>    WireGuard 对外端口 (默认 52116,需与云安全组一致)
+  --user <用户名>     面板管理员用户名 (默认 admin)
+  --password <密码>   面板管理员密码 (默认 123456789123,部署后请尽快修改)
+  --dns <DNS>         下发给客户端的 DNS (默认 1.1.1.1)
+  --ipv4-cidr <网段>  隧道 IPv4 网段 (默认 10.8.0.0/24)
+  --harden-ssh        禁用 SSH 密码登录 (需要已配置公钥)
+  --reinstall         已有部署时不询问,直接删除并重装 (会清空所有客户端)
+  -h, --help          显示本帮助
+EOF
 }
-
-# 部署阶段中途失败 (或被 Ctrl-C 中断) 时自动清理半成品,方便直接重新运行。
-# 脚本开头已确认是全新安装 (没有旧 compose、没有同名容器),所以这里只会删掉本次创建的东西。
-on_exit() {
-  local rc=$?
-  if (( rc != 0 && DEPLOY_STARTED )); then
-    warn "部署中途失败,正在清理本次创建的容器和数据卷"
-    trap - EXIT
-    if [[ -f "$COMPOSE_FILE" ]]; then
-      ( cd "$INSTALL_DIR" && docker compose down -v ) >/dev/null 2>&1 || true
-    fi
-    docker rm -f wg-easy >/dev/null 2>&1 || true
-    rm -rf "$INSTALL_DIR"
-    warn "已清理完毕,排查上面的报错后可直接重新运行脚本"
-  fi
-}
-trap on_exit EXIT
 
 # ----------------------------- 参数解析 --------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --host)          WG_HOST="${2:?--host 缺少参数值}"; shift 2 ;;
-    --port)          WG_PORT="${2:?--port 缺少参数值}"; shift 2 ;;
-    --user)          ADMIN_USER="${2:?--user 缺少参数值}"; shift 2 ;;
-    --password)      ADMIN_PASS="${2:?--password 缺少参数值}"; shift 2 ;;
-    --dns)           WG_DNS="${2:?--dns 缺少参数值}"; shift 2 ;;
-    --ipv4-cidr)     WG_IPV4_CIDR="${2:?--ipv4-cidr 缺少参数值}"; shift 2 ;;
-    --docker-mirror) DOCKER_MIRROR="${2:?--docker-mirror 缺少参数值}"; shift 2 ;;
-    --harden-ssh)    DO_HARDEN_SSH=1; shift ;;
-    -h|--help)       usage; exit 0 ;;
+    --host)       WG_HOST="${2:?--host 缺少参数值}"; shift 2 ;;
+    --port)       WG_PORT="${2:?--port 缺少参数值}"; shift 2 ;;
+    --user)       ADMIN_USER="${2:?--user 缺少参数值}"; shift 2 ;;
+    --password)   ADMIN_PASS="${2:?--password 缺少参数值}"; shift 2 ;;
+    --dns)        WG_DNS="${2:?--dns 缺少参数值}"; shift 2 ;;
+    --ipv4-cidr)  WG_IPV4_CIDR="${2:?--ipv4-cidr 缺少参数值}"; shift 2 ;;
+    --harden-ssh) DO_HARDEN_SSH=1; shift ;;
+    --reinstall)  FORCE_REINSTALL=1; shift ;;
+    -h|--help)    usage; exit 0 ;;
     *) die "未知参数: $1 (用 --help 查看用法)" ;;
   esac
 done
@@ -111,52 +87,80 @@ done
 [[ $EUID -eq 0 ]] || die "请以 root 运行 (例如先执行 sudo -i)"
 command -v apt-get >/dev/null 2>&1 || die "目前只支持 Debian/Ubuntu (需要 apt-get)"
 
-if [[ -f "$COMPOSE_FILE" ]]; then
-  die "检测到已有部署: $COMPOSE_FILE。为避免覆盖现有数据,脚本只用于全新安装。"
-fi
-if command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' | grep -qx 'wg-easy'; then
-  die "已存在名为 wg-easy 的容器,请先处理后再运行。"
+# ----------------------------- 已有部署检测 ----------------------------------
+has_existing() {
+  [[ -f "$COMPOSE_FILE" ]] && return 0
+  command -v docker >/dev/null 2>&1 || return 1
+  docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 'wg-easy' && return 0
+  docker volume ls -q 2>/dev/null | grep -qx 'wg-easy_etc_wireguard' && return 0
+  return 1
+}
+
+remove_existing() {
+  log "删除旧的 wg-easy 部署"
+  if command -v docker >/dev/null 2>&1; then
+    if [[ -f "$COMPOSE_FILE" ]]; then
+      ( cd "$INSTALL_DIR" && docker compose down -v --remove-orphans ) || warn "docker compose down 失败,继续强制清理"
+    fi
+    # compose 文件丢失或 down 不彻底时的兜底清理
+    docker rm -f wg-easy >/dev/null 2>&1 || true
+    docker volume rm -f wg-easy_etc_wireguard >/dev/null 2>&1 || true
+    docker network rm wg-easy_wg >/dev/null 2>&1 || true
+  fi
+  rm -rf "$INSTALL_DIR"
+  rm -f "$CRED_FILE"
+}
+
+if has_existing; then
+  warn "检测到已有 wg-easy 部署 (${INSTALL_DIR} / 容器 wg-easy / 数据卷 etc_wireguard)。"
+  warn "重装会删除容器、数据卷和配置文件,面板里所有客户端与密钥都会丢失,且无法恢复!"
+  if (( FORCE_REINSTALL )); then
+    ans="y"
+  else
+    printf '\033[1;33m[?]\033[0m 是否删除旧部署并重装? [y/N] ' >&2
+    # 经 curl | bash 运行时 stdin 是管道,必须从 /dev/tty 读取
+    if ! read -r ans 2>/dev/null </dev/tty; then
+      echo >&2
+      die "当前是非交互环境,无法询问。确认要重装请加 --reinstall (bash -s -- --reinstall)"
+    fi
+  fi
+  case "$ans" in
+    y|Y|yes|YES|Yes) remove_existing ;;
+    *) die "已取消,未做任何改动。" ;;
+  esac
 fi
 
-# 端口:默认 52116,可用 --port 修改 (云安全组由你自己配置,脚本不会随机选端口)
+# 端口:默认 52116,可用 --port 修改 (云安全组由你自己配置,脚本不再随机选端口)
 [[ "$WG_PORT" =~ ^[0-9]+$ ]] && (( WG_PORT >= 1 && WG_PORT <= 65535 )) || die "端口不合法: $WG_PORT"
 (( WG_PORT != WEB_PORT )) || die "WireGuard 端口不能与面板端口 ${WEB_PORT} 相同"
+log "将使用 UDP ${WG_PORT};请确认云安全组已放行该端口 (需放行 IPv6)"
 
+# 账号密码
 [[ "$ADMIN_USER" =~ ^[A-Za-z0-9._-]{3,32}$ ]] || die "用户名只允许字母数字和 . _ - (3-32 位)"
-
-if [[ -n "$ADMIN_PASS" ]]; then
-  # 密码会写进 YAML 和 shell heredoc,限制字符集避免被插值或破坏格式
-  [[ "$ADMIN_PASS" =~ ^[A-Za-z0-9._@%+=:,-]{12,64}$ ]] \
-    || die "密码只允许字母数字和 . _ @ % + = : , -,长度 12-64 位"
+# 密码会写进 compose 的双引号字符串,这两个字符会破坏 YAML
+[[ "$ADMIN_PASS" != *\"* && "$ADMIN_PASS" != *\\* ]] || die '密码不能包含双引号 " 或反斜杠 \'
+if (( ${#ADMIN_PASS} < 12 )) \
+   || ! [[ "$ADMIN_PASS" =~ [A-Z] && "$ADMIN_PASS" =~ [a-z] && "$ADMIN_PASS" =~ [0-9] && "$ADMIN_PASS" =~ [^A-Za-z0-9] ]]; then
+  warn "密码强度可能不满足 wg-easy v15 的要求 (≥12 位,含大小写、数字、特殊字符)。"
+  warn "如果不满足,INIT_* 可能不生效,部署后会看到\"初始化向导\",按提示手动设置即可。"
 fi
+# compose 里 $ 会被当成变量插值,需要写成 $$
+COMPOSE_PASS="${ADMIN_PASS//\$/\$\$}"
 
-if [[ -n "$DOCKER_MIRROR" ]]; then
-  [[ "$DOCKER_MIRROR" =~ ^(Aliyun|AzureChinaCloud)$ ]] || die "--docker-mirror 只支持 Aliyun 或 AzureChinaCloud"
-fi
-
-log "将使用 UDP ${WG_PORT};请确认云安全组已放行该端口 (IPv4 与 IPv6 规则要分别添加)"
-
-# ----------------------------- 1. 安装基础工具 --------------------------------
+# ----------------------------- 1. 基础工具 -----------------------------------
 log "安装基础工具 (不做系统升级,需要的话请自行 apt full-upgrade 后重启再运行本脚本)"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y </dev/null
-apt-get install -y curl ca-certificates iproute2 </dev/null
+apt-get update -y
+apt-get install -y curl ca-certificates iproute2
 
-# 未指定密码时使用默认密码 admin (面板只监听 127.0.0.1,需 SSH 转发才能访问)
-USING_DEFAULT_PASS=0
-if [[ -z "$ADMIN_PASS" ]]; then
-  ADMIN_PASS="admin"
-  USING_DEFAULT_PASS=1
-fi
-
-# 探测 Host (优先 IPv6;排除 ULA、临时地址和已弃用地址)
+# 探测 Host (优先 IPv6;排除临时地址、已弃用地址和 ULA)
 detect_ipv6() {
   local ip
   ip="$(curl -6 -fsS --max-time 5 https://api64.ipify.org 2>/dev/null || true)"
   if [[ "$ip" == *:* ]]; then echo "$ip"; return; fi
-  ip -6 addr show scope global 2>/dev/null \
-    | awk '/inet6/ && !/temporary|deprecated/ && $2 !~ /^f[cd]/ {print $2; exit}' \
-    | cut -d/ -f1 || true
+  ip -6 addr show scope global -deprecated 2>/dev/null \
+    | awk '/inet6/ && !/temporary/ {print $2}' | cut -d/ -f1 \
+    | grep -viE '^f[cd]' | head -n1 || true
 }
 
 if [[ -z "$WG_HOST" ]]; then
@@ -170,6 +174,8 @@ HOST_FOR_INIT="$WG_HOST"
 if [[ "$WG_HOST" == *:* && "$WG_HOST" != \[* ]]; then
   HOST_FOR_INIT="[${WG_HOST}]"
 fi
+# SSH 命令里的地址:IPv6 不加方括号,直接用探测到的 Host
+SSH_HOST="${WG_HOST#[}"; SSH_HOST="${SSH_HOST%]}"
 
 # 端口占用检查 (放在安装之后,确保 ss 可用)
 if ss -H -uln "sport = :${WG_PORT}" | grep -q .; then
@@ -179,22 +185,10 @@ if ss -H -tln "sport = :${WEB_PORT}" | grep -q .; then
   die "TCP ${WEB_PORT} 已被占用"
 fi
 
-# 网段冲突检查 (仅检测路由表里是否已有完全相同的网段,不做重叠计算)
-for net in "$DOCKER_SUBNET" "$WG_IPV4_CIDR"; do
-  if ip -4 route show | awk '{print $1}' | grep -qx "$net"; then
-    die "网段 ${net} 已存在于本机路由表,会产生冲突。请用 --ipv4-cidr 换一个隧道网段,或先处理现有网络"
-  fi
-done
-
 # ----------------------------- 2. Docker -------------------------------------
 if ! command -v docker >/dev/null 2>&1; then
-  if [[ -n "$DOCKER_MIRROR" ]]; then
-    log "安装 Docker (官方脚本 get.docker.com,镜像源: ${DOCKER_MIRROR})"
-    curl -fsSL https://get.docker.com | sh -s -- --mirror "$DOCKER_MIRROR"
-  else
-    log "安装 Docker (官方脚本 get.docker.com)"
-    curl -fsSL https://get.docker.com | sh
-  fi
+  log "安装 Docker (官方脚本 get.docker.com)"
+  curl -fsSL https://get.docker.com | sh
 fi
 docker compose version >/dev/null 2>&1 || die "缺少 docker compose 插件,请参考 Docker 官方文档安装"
 systemctl enable --now docker
@@ -205,20 +199,21 @@ systemctl enable --now docker
 write_compose() {
   local mode="$1" init_block=""
   if [[ "$mode" == "init" ]]; then
-    init_block="$(cat <<INIT_END
+    init_block="$(cat <<EOF
       - "INIT_ENABLED=true"
       - "INIT_USERNAME=${ADMIN_USER}"
-      - "INIT_PASSWORD=${ADMIN_PASS}"
+      - "INIT_PASSWORD=${COMPOSE_PASS}"
       - "INIT_HOST=${HOST_FOR_INIT}"
       - "INIT_PORT=${WG_PORT}"
       - "INIT_DNS=${WG_DNS}"
       - "INIT_IPV4_CIDR=${WG_IPV4_CIDR}"
       - "INIT_IPV6_CIDR=${WG_IPV6_CIDR}"
       - "INIT_ALLOWED_IPS=${WG_ALLOWED_IPS}"
-INIT_END
+EOF
 )"
   fi
-  cat > "$COMPOSE_FILE" <<COMPOSE_END
+
+  cat > "$COMPOSE_FILE" <<EOF
 # 由 setup-wg-easy.sh 生成,结构参照 wg-easy 官方 compose
 volumes:
   etc_wireguard:
@@ -240,7 +235,7 @@ ${init_block}
     restart: unless-stopped
     networks:
       wg:
-        ipv4_address: ${DOCKER_IP}
+        ipv4_address: 10.42.42.42
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
@@ -255,8 +250,8 @@ networks:
     ipam:
       driver: default
       config:
-        - subnet: ${DOCKER_SUBNET}
-COMPOSE_END
+        - subnet: 10.42.42.0/24
+EOF
   chmod 600 "$COMPOSE_FILE"
 }
 
@@ -270,38 +265,20 @@ wait_web() {
   return 1
 }
 
-# 等待初始化写入数据库 (检测数据卷里是否出现 .db 文件;该判断依据 v15 的存储方式,
-# 若检测不到则退回到固定等待)
-wait_init() {
-  local i
-  for i in $(seq 1 30); do
-    if docker exec wg-easy sh -c 'ls /etc/wireguard/*.db >/dev/null 2>&1' </dev/null; then
-      return 0
-    fi
-    sleep 2
-  done
-  return 1
-}
-
 log "部署 wg-easy (UDP ${WG_PORT}, 面板 127.0.0.1:${WEB_PORT})"
 mkdir -p "$INSTALL_DIR"
-DEPLOY_STARTED=1
 write_compose init
-( cd "$INSTALL_DIR" && docker compose up -d </dev/null )
+( cd "$INSTALL_DIR" && docker compose up -d )
 
 log "等待面板启动"
 wait_web || { docker logs --tail 50 wg-easy || true; die "面板 120 秒内没有响应,请检查上面的日志"; }
-if ! wait_init; then
-  warn "未能确认初始化已写入数据库,额外等待 10 秒"
-  sleep 10
-fi
+sleep 5
 
 # 初始化完成后,去掉 compose 里的明文账号密码并重建容器 (数据卷保留)
 log "初始化完成,移除 compose 中的明文密码并重建容器"
 write_compose plain
-( cd "$INSTALL_DIR" && docker compose up -d --force-recreate </dev/null )
+( cd "$INSTALL_DIR" && docker compose up -d --force-recreate )
 wait_web || warn "重建后面板暂时没有响应,请稍后用 docker logs wg-easy 查看"
-DEPLOY_STARTED=0   # 部署已完成,之后 SSH 加固或自检出问题时不要清理可用的部署
 
 # ----------------------------- 4. 可选:SSH 加固 ------------------------------
 if (( DO_HARDEN_SSH )); then
@@ -316,10 +293,10 @@ if (( DO_HARDEN_SSH )); then
     root_login="prohibit-password"
     [[ "$login_user" != "root" ]] && root_login="no"
     # 文件名用 00- 开头:sshd 取第一个匹配的值,必须排在 50-cloud-init.conf 之前才生效
-    cat > /etc/ssh/sshd_config.d/00-hardening.conf <<SSHD_END
+    cat > /etc/ssh/sshd_config.d/00-hardening.conf <<EOF
 PasswordAuthentication no
 PermitRootLogin ${root_login}
-SSHD_END
+EOF
     if sshd -t; then
       systemctl restart ssh 2>/dev/null || systemctl restart sshd
       warn "请不要关闭当前窗口,另开终端确认密钥登录正常后再退出"
@@ -331,27 +308,28 @@ SSHD_END
 fi
 
 # ----------------------------- 5. 结果与自检 ---------------------------------
-CRED_FILE="/root/wg-easy-credentials.txt"
-cat > "$CRED_FILE" <<CRED_END
-面板地址 : http://127.0.0.1:${WEB_PORT} (需先建立 SSH 端口转发)
+( umask 077
+  cat > "$CRED_FILE" <<EOF
+面板地址 : http://127.0.0.1:${WEB_PORT}  (需先建立 SSH 端口转发)
 用户名   : ${ADMIN_USER}
 密码     : ${ADMIN_PASS}
 Host     : ${HOST_FOR_INIT}
 UDP 端口 : ${WG_PORT}
-CRED_END
+EOF
+)
 chmod 600 "$CRED_FILE"
 
 echo
 log "自检"
+# 取所有 TCP 监听地址,只要存在非 127.0.0.1 的就告警
 web_listen="$(ss -H -tln "sport = :${WEB_PORT}" | awk '{print $4}')"
 if [[ -z "$web_listen" ]]; then
-  warn "没有检测到面板端口 ${WEB_PORT} 在监听,请用 docker logs wg-easy 查看"
+  warn "没有发现面板端口 ${WEB_PORT} 的监听,请用 docker logs wg-easy 检查"
 elif grep -qv '^127\.0\.0\.1:' <<<"$web_listen"; then
   warn "面板端口似乎监听在非回环地址,请检查 compose 的 ports 配置!"
 else
   echo "  面板端口仅监听 127.0.0.1 ✓"
 fi
-
 echo "  UDP ${WG_PORT} 监听情况:"
 ss -uln "sport = :${WG_PORT}" | sed 's/^/    /'
 if ss -H -uln "sport = :${WG_PORT}" | grep -q '\[::\]:'; then
@@ -360,11 +338,7 @@ else
   warn "UDP ${WG_PORT} 未发现 IPv6 监听,请检查 Docker 端口发布配置。"
 fi
 
-if (( USING_DEFAULT_PASS )); then
-  warn "当前使用的是默认密码 admin,登录面板后请尽快在设置里修改"
-fi
-
-cat <<DONE_END
+cat <<EOF
 
 ==================== 部署完成 ====================
 管理员账号已保存到 ${CRED_FILE} (权限 600),查看后请自行妥善保管或删除。
@@ -373,16 +347,22 @@ cat <<DONE_END
   密码   : ${ADMIN_PASS}
 
 下一步:
-1. 云厂商安全组放行 UDP ${WG_PORT},IPv4 与 IPv6 要分别添加。
-2. 在你自己的电脑上建立 SSH 端口转发 (IPv6 地址不要加方括号):
-     ssh -L ${WEB_PORT}:127.0.0.1:${WEB_PORT} ${SUDO_USER:-root}@<服务器地址>
+1. 安全组放行 UDP ${WG_PORT} (需放行 IPv6)。
+2. 先输入 exit 退出当前的 SSH 连接,再建立 SSH 端口转发:
+     ssh -i <私钥路径> -L ${WEB_PORT}:127.0.0.1:${WEB_PORT} ${SUDO_USER:-root}@${SSH_HOST}
+   - <私钥路径> 是与服务器 authorized_keys 中公钥对应的私钥文件;
+     如果是用密码登录的,去掉 "-i <私钥路径>" 即可
+   - 登录后请保持这个 SSH 窗口不要关闭,关闭后转发就会断开
    然后浏览器打开 http://127.0.0.1:${WEB_PORT}
-3. 如果打开后看到的是"初始化向导"而不是登录页,说明 INIT_* 没有生效,
-   按向导手动填写:
+3. 如果打开后看到的是"初始化向导"而不是登录页,说明 INIT_* 没有生效
+   (已有用户反馈过),按向导手动填写:
      Host=${HOST_FOR_INIT}  Port=${WG_PORT}
    完成后在管理设置里把默认 AllowedIPs 改为 ${WG_ALLOWED_IPS}。
 4. 面板里点 New Client 添加设备;客户端连上后验证:
      curl -4 ifconfig.me        # 应显示服务器 IPv4
      docker exec wg-easy wg show
+
+升级: cd ${INSTALL_DIR} && docker compose pull && docker compose up -d
+备份: 升级前在面板里下载备份;所有 peer 与私钥都在 etc_wireguard 数据卷里
 =================================================
-DONE_END
+EOF
