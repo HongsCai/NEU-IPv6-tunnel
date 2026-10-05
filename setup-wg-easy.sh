@@ -6,10 +6,6 @@
 #   客户端 --(IPv6 / UDP 自定义端口)--> 服务器 --(IPv4 出口)--> Internet
 #   隧道内部只走 IPv4;Web 面板只监听 127.0.0.1,通过 SSH 端口转发访问。
 #
-# 用法 (root 身份运行,例如先 sudo -i):
-#   bash setup-wg-easy.sh --host vpn.example.com --port 52116
-#   bash setup-wg-easy.sh            # 不带参数:自动探测 IPv6,端口用 52116
-#
 # 选项 (也可用同名环境变量传入,见下方默认值):
 #   --host <域名或IP>   客户端连接的地址 (IPv6 字面量无需加方括号)
 #   --port <UDP端口>    WireGuard 对外端口 (默认: 52116;必须与你在云安全组放行的端口一致)
@@ -18,6 +14,7 @@
 #                       也不建议用命令行传,会留在历史记录里)
 #   --dns <DNS>         下发给客户端的 DNS (默认: 1.1.1.1)
 #   --ipv4-cidr <网段>  隧道 IPv4 网段 (默认: 10.8.0.0/24)
+#   --allowed-ips <列表> 客户端默认 AllowedIPs,逗号分隔,不要带空格 (默认: 0.0.0.0/1,128.0.0.0/1)
 #   --harden-ssh        禁用 SSH 密码登录 (需要当前登录用户已配置公钥)
 #                       (默认不改;IPv6 入站 UDP 测试不通时再用)
 #   --reinstall         检测到已有部署时不再询问,直接删除并重装 (非交互环境必须加)
@@ -38,7 +35,7 @@ ADMIN_PASS="${ADMIN_PASS:-123456789123}"
 WG_DNS="${WG_DNS:-1.1.1.1}"
 WG_IPV4_CIDR="${WG_IPV4_CIDR:-10.8.0.0/24}"
 WG_IPV6_CIDR="${WG_IPV6_CIDR:-fd42:42:42::/64}"   # wg-easy 要求与 IPv4 网段成对设置
-WG_ALLOWED_IPS="${WG_ALLOWED_IPS:-0.0.0.0/0}"     # 只接管 IPv4,不含 ::/0
+WG_ALLOWED_IPS="${WG_ALLOWED_IPS:-0.0.0.0/1,128.0.0.0/1}"     # 只接管 IPv4,不含 ::/0
 DO_HARDEN_SSH=0
 FORCE_REINSTALL=0
 CRED_FILE="/root/wg-easy-credentials.txt"
@@ -61,6 +58,7 @@ usage() {
   --password <密码>   面板管理员密码 (默认 123456789123,部署后请尽快修改)
   --dns <DNS>         下发给客户端的 DNS (默认 1.1.1.1)
   --ipv4-cidr <网段>  隧道 IPv4 网段 (默认 10.8.0.0/24)
+  --allowed-ips <列表> 客户端默认 AllowedIPs,逗号分隔 (默认 0.0.0.0/1,128.0.0.0/1)
   --harden-ssh        禁用 SSH 密码登录 (需要已配置公钥)
   --reinstall         已有部署时不询问,直接删除并重装 (会清空所有客户端)
   -h, --help          显示本帮助
@@ -76,12 +74,15 @@ while [[ $# -gt 0 ]]; do
     --password)   ADMIN_PASS="${2:?--password 缺少参数值}"; shift 2 ;;
     --dns)        WG_DNS="${2:?--dns 缺少参数值}"; shift 2 ;;
     --ipv4-cidr)  WG_IPV4_CIDR="${2:?--ipv4-cidr 缺少参数值}"; shift 2 ;;
+	--allowed-ips) WG_ALLOWED_IPS="${2:?--allowed-ips 缺少参数值}"; shift 2 ;;
     --harden-ssh) DO_HARDEN_SSH=1; shift ;;
     --reinstall)  FORCE_REINSTALL=1; shift ;;
     -h|--help)    usage; exit 0 ;;
     *) die "未知参数: $1 (用 --help 查看用法)" ;;
   esac
 done
+
+WG_ALLOWED_IPS="${WG_ALLOWED_IPS// /}"
 
 # ----------------------------- 前置检查 --------------------------------------
 [[ $EUID -eq 0 ]] || die "请以 root 运行 (例如先执行 sudo -i)"
@@ -348,8 +349,8 @@ cat <<EOF
 
 下一步:
 1. 安全组放行 UDP ${WG_PORT} (需放行 IPv6)。
-2. 先输入 exit 退出当前的 SSH 连接,再建立 SSH 端口转发:
-     ssh -i <私钥路径> -L ${WEB_PORT}:127.0.0.1:${WEB_PORT} ${SUDO_USER:-root}@${SSH_HOST}
+2. 先输入 exit 退出当前的 SSH 连接,然后重新连接,并加上端口转发 -L ${WEB_PORT}:127.0.0.1:${WEB_PORT}:
+     ssh -i <私钥路径> ${SUDO_USER:-root}@${SSH_HOST} -L ${WEB_PORT}:127.0.0.1:${WEB_PORT}
    - <私钥路径> 是与服务器 authorized_keys 中公钥对应的私钥文件;
      如果是用密码登录的,去掉 "-i <私钥路径>" 即可
    - 登录后请保持这个 SSH 窗口不要关闭,关闭后转发就会断开
