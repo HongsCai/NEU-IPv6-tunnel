@@ -131,7 +131,7 @@
 
 ## 3x-ui Clash 订阅模板
 
-替换变量后，把这一整段粘贴到 Clash 全局路由规则。预填的是东北大学校园网配置。如我选择其他学校，替换 `neu.edu.cn`、`ipgw.neu.edu.cn`、门户 IPv4 和两台校内 DNS。如我选择无需校园网，删除 `dns.nameserver-policy` 的 `+.neu.edu.cn` 整段，以及 `rules` 中的门户 `DOMAIN`、门户 `IP-CIDR`、校园 `DOMAIN-SUFFIX`。
+替换变量后，把这一整段粘贴到 Clash 全局路由规则。预填的是东北大学校园网配置。如我选择其他学校，替换学校后缀、门户域名、门户 IPv4 和校内 DNS，并按该校的公开 WebVPN 和 SSO 域名调整两条专用 DNS 策略。如我选择无需校园网，删除 `dns.nameserver-policy` 中的三条学校策略，以及 `rules` 中的门户 `DOMAIN`、门户 `IP-CIDR`、校园 `DOMAIN-SUFFIX`。
 
 ~~~yaml
 mixed-port: 7897
@@ -154,14 +154,20 @@ dns:
   proxy-server-nameserver:
     - "udp://[2400:3200::1]:53#DIRECT"
   nameserver-policy:
-    "geosite:cn,private":
-      - "udp://[2400:3200::1]:53#DIRECT"
-      - "https://223.5.5.5/dns-query#连接方式"
     "+.neu.edu.cn":
       - "udp://[2400:3200::1]:53#DIRECT"
       - "udp://202.118.1.29:53#DIRECT"
       - "udp://202.118.1.53:53#DIRECT"
+    "+.pass.neu.edu.cn":
+      - "udp://[2400:3200::1]:53#DIRECT"
+      - "https://223.5.5.5/dns-query#DIRECT"
+    "+.webvpn.neu.edu.cn":
+      - "udp://[2400:3200::1]:53#DIRECT"
+      - "https://223.5.5.5/dns-query#DIRECT"
     "+.NEW_NODE_DOMAIN_SUFFIX":
+      - "udp://[2400:3200::1]:53#DIRECT"
+      - "https://223.5.5.5/dns-query#连接方式"
+    "geosite:cn,private":
       - "udp://[2400:3200::1]:53#DIRECT"
       - "https://223.5.5.5/dns-query#连接方式"
   nameserver:
@@ -223,11 +229,11 @@ rules:
   - "IP-CIDR6,::1/128,DIRECT,no-resolve"
   - "DOMAIN,ipgw.neu.edu.cn,DIRECT"
   - "IP-CIDR,202.118.1.87/32,DIRECT,no-resolve"
+  - "DOMAIN-SUFFIX,neu.edu.cn,DIRECT"
   - "AND,((IN-TYPE,TUN),(IP-CIDR6,2000::/3,no-resolve),(GEOIP,CN,no-resolve)),直连"
   - "AND,((DST-PORT,15087),(OR,((DOMAIN,NEW_IPV6_FQDN),(IP-CIDR6,NEW_GLOBAL_IPV6/128,no-resolve)))),直连"
   - "AND,((DST-PORT,15087),(OR,((DOMAIN,NEW_IPV4_FQDN),(IP-CIDR,NEW_PUBLIC_IPV4/32,no-resolve)))),DIRECT"
   - "IN-TYPE,TUN,连接方式"
-  - "DOMAIN-SUFFIX,neu.edu.cn,DIRECT"
   - "DOMAIN-SUFFIX,NEW_NODE_DOMAIN_SUFFIX,DIRECT"
   - "GEOSITE,private,DIRECT"
   - "GEOSITE,cn,DIRECT"
@@ -261,7 +267,7 @@ proxies:
 
 按下列项目区分 **实测通过、未验证、需我操作**。HTTP/TCP 端口测试无法替代真实的 Hysteria2 UDP 拨号。
 
-- **VPS**：查双栈出站、两个 UDP 49606 监听、面板和订阅端口。用不同地址族分别验证新面板路径、TLS SAN、旧根路径、实际订阅输出，核对两个地址、SNI、证书校验、代理组筛选和配置字段。记录 IPv4 出站检测结果，和公网入站字段分别核对。
+- **VPS**：查双栈出站、两个 UDP 49606 监听、面板和订阅端口。用不同地址族分别验证新面板路径、TLS SAN、旧根路径、实际订阅输出，核对两个地址、SNI、证书校验、代理组筛选和配置字段。保留校园网配置时，确认学校的 `DOMAIN-SUFFIX` 直连规则排在所有 TUN 分流规则之前。记录 IPv4 出站检测结果，和公网入站字段分别核对。
 - **Windows 与 Android**：在已有授权、设备可用时执行客户端验证。先分别试用两条节点，再启用 TUN 的规则模式。目标是普通公网 IPv4 走代理、国内 IPv6 进入 TUN 后由 Mihomo 直连、国外 IPv6 走代理，门户和管理面板按前置例外访问。检查 Hysteria2 外层 UDP 走设备物理网卡。订阅带两个端点排除，如果客户端覆写为空，先检查运行态与实际连通性，确需改本机设置时再说明。国内 IPv6 使用前置 Mihomo 规则，无需国内 IPv6 CIDR 排除列表。
 - **系统代理模式**：关闭 TUN，验证受系统代理接管的应用。国内 IPv4、IPv6 直连，国外走代理。浏览器、命令行可用显式代理加连接日志对照。
 - **DNS 和回环**：确认 `redir-host` 支持 A 和 AAAA，对照已部署的国内 DNS 策略以及通过节点的国外 DoH。测试时区分 DNS 服务器使用的地址族与返回记录类型。检查外层连接没有进隧道循环。

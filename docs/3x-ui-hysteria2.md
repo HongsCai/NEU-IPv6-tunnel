@@ -48,7 +48,7 @@ VPS 示例域名和公网 IP 使用预留的文档值，部署前填入自己的
 | `NEW_CLASH_PATH` / `NEW_SUB_ID` | 由 3x-ui 生成 | HTTPS 订阅路径和新客户端的订阅标识，使用面板实际生成的私有 URL |
 | `V4_INBOUND_TAG` / `V6_INBOUND_TAG` | 由 3x-ui 生成 | 读取新机运行配置中的实际标签，用于 Xray 路由 |
 | 订阅节点名称前缀 | `VPS Hysteria2 IPv4` / `VPS Hysteria2 IPv6` | 同步填写入站备注和 YAML 的两个 `filter` |
-| 校园域名后缀 | `neu.edu.cn` | 东北大学校园网可保留。换学校时同步修改 DNS 策略和系统代理直连规则 |
+| 校园域名后缀 | `neu.edu.cn` | 东北大学校园网可保留。换学校时同步修改 DNS 策略及 TUN 和系统代理共用的直连规则 |
 | 校园认证门户 | `ipgw.neu.edu.cn` | 换学校时修改门户的 `DOMAIN` 直连规则 |
 | 校园门户 IPv4 | `202.118.1.87/32` | 门户地址变化时更新 `IP-CIDR`，保留 `/32` |
 | 校内 IPv4 DNS | `202.118.1.29`、`202.118.1.53` | 校园网内使用。换学校时填校内 DNS，只有一个时删去另外一条上游 |
@@ -378,14 +378,20 @@ dns:
   proxy-server-nameserver:
     - "udp://[2400:3200::1]:53#DIRECT"
   nameserver-policy:
-    "geosite:cn,private":
-      - "udp://[2400:3200::1]:53#DIRECT"
-      - "https://223.5.5.5/dns-query#连接方式"
     "+.neu.edu.cn":
       - "udp://[2400:3200::1]:53#DIRECT"
       - "udp://202.118.1.29:53#DIRECT"
       - "udp://202.118.1.53:53#DIRECT"
+    "+.pass.neu.edu.cn":
+      - "udp://[2400:3200::1]:53#DIRECT"
+      - "https://223.5.5.5/dns-query#DIRECT"
+    "+.webvpn.neu.edu.cn":
+      - "udp://[2400:3200::1]:53#DIRECT"
+      - "https://223.5.5.5/dns-query#DIRECT"
     "+.NEW_NODE_DOMAIN_SUFFIX":
+      - "udp://[2400:3200::1]:53#DIRECT"
+      - "https://223.5.5.5/dns-query#连接方式"
+    "geosite:cn,private":
       - "udp://[2400:3200::1]:53#DIRECT"
       - "https://223.5.5.5/dns-query#连接方式"
   nameserver:
@@ -447,11 +453,11 @@ rules:
   - "IP-CIDR6,::1/128,DIRECT,no-resolve"
   - "DOMAIN,ipgw.neu.edu.cn,DIRECT"
   - "IP-CIDR,202.118.1.87/32,DIRECT,no-resolve"
+  - "DOMAIN-SUFFIX,neu.edu.cn,DIRECT"
   - "AND,((IN-TYPE,TUN),(IP-CIDR6,2000::/3,no-resolve),(GEOIP,CN,no-resolve)),直连"
   - "AND,((DST-PORT,15087),(OR,((DOMAIN,NEW_IPV6_FQDN),(IP-CIDR6,NEW_GLOBAL_IPV6/128,no-resolve)))),直连"
   - "AND,((DST-PORT,15087),(OR,((DOMAIN,NEW_IPV4_FQDN),(IP-CIDR,NEW_PUBLIC_IPV4/32,no-resolve)))),DIRECT"
   - "IN-TYPE,TUN,连接方式"
-  - "DOMAIN-SUFFIX,neu.edu.cn,DIRECT"
   - "DOMAIN-SUFFIX,NEW_NODE_DOMAIN_SUFFIX,DIRECT"
   - "GEOSITE,private,DIRECT"
   - "GEOSITE,cn,DIRECT"
@@ -461,10 +467,10 @@ rules:
 
 ### 7.1 规则顺序与校园例外
 
-- 局域网地址和校园认证门户先直连，保留未登录校园网时访问登录页的路径。模板中的门户和校内 DNS 供东北大学校园网使用。换学校时替换域名、门户 IPv4 和校内 DNS。没有校园网需求时可删除四处配置，分别是 `dns.nameserver-policy` 下整段 `+.neu.edu.cn`、`rules` 下的门户 `DOMAIN`、门户 `IP-CIDR` 和学校 `DOMAIN-SUFFIX`。
+- 局域网地址和校园认证门户先直连，保留未登录校园网时访问登录页的路径。换学校时替换域名、门户 IPv4 和校内 DNS，并按该校的公开 WebVPN 和 SSO 域名调整两条专用 DNS 策略。没有校园网需求时，删除 `dns.nameserver-policy` 中的三条学校策略，以及 `rules` 中的门户 `DOMAIN`、门户 `IP-CIDR` 和学校 `DOMAIN-SUFFIX`。
 - `IN-TYPE,TUN` 限定了 TUN 规则的入口。已知真实目标地址为公网 IPv6、同时被 GeoIP 识别为中国大陆时才用 IPv6 直出。使用 `redir-host` 可保留真实地址。`no-resolve` 避免 TUN 规则因为额外查 DNS、取错候选地址而误把 IPv4 流量送去 IPv6 直连。GeoIP 数据把无法识别或尚未更新的地址交给后续代理兜底。
 - 管理面板规则匹配「目标主机域名或 IP + 端口 15087」，在 TUN 兜底之前。IPv6 使用 IPv6-only 直连出站，IPv4 使用普通 DIRECT。面板端口改动时，两条 `DST-PORT` 都改。该规则不覆盖订阅 TCP 2096 与 SSH TCP 22。
-- `IN-TYPE,TUN,连接方式` 命中以后，后面的学校域名、父域名、GeoSite、GeoIP 和 MATCH 处理非 TUN 流量。因此即使是国内域名，TUN 流量若目标是公网 IPv4，也按 TUN 规则交给代理，校园门户、面板等例外优先。系统代理下会优先使用 GeoSite 再用 GeoIP。
+- 学校域名直连规则放在 TUN 分流前，覆盖 `webvpn.neu.edu.cn` 和 `pass.neu.edu.cn`，在 TUN 和系统代理模式下都生效。未命中前置例外的公网 IPv4 TUN 流量通过 `IN-TYPE,TUN,连接方式` 走代理。后续父域名、GeoSite、GeoIP 和 MATCH 规则处理非 TUN 流量。
 - GeoSite 和 GeoIP 需要能加载兼容的数据库。迁移初次无网时可以用已安装客户端的 geodata，或先用可访问网络让核心完成下载。 [Mihomo 路由规则](https://wiki.metacubex.one/config/rules/) · [Mihomo TUN](https://wiki.metacubex.one/config/inbound/tun/) · [Mihomo Hysteria2](https://wiki.metacubex.one/config/proxies/hysteria2/)
 
 ### 7.2 DNS 工作方式
@@ -472,13 +478,14 @@ rules:
 | 请求 | 当前上游 | 出口 |
 | --- | --- | --- |
 | 国内、私有域名及 VPS 父域名 | 阿里 IPv6 UDP DNS 与经隧道的阿里 IPv4 DoH | 前者本地 IPv6 直连，后者经选中的 Hysteria2 节点。多个上游由 Mihomo 调度，不依赖固定的主备顺序 |
-| 东北大学校园域名 | 阿里 IPv6 UDP DNS，外加校内 IPv4 DNS `202.118.1.29`、`202.118.1.53` | 均直连。校内 DNS 是本模板有意保留的 IPv4 DNS 直连例外 |
+| 东北大学 WebVPN 和 SSO | 阿里 IPv6 UDP DNS、阿里公网 IPv4 DoH | 均直连，供校外纯 IPv4 网络解析这两个公开域名 |
+| 其他东北大学校园域名 | 阿里 IPv6 UDP DNS，外加校内 IPv4 DNS `202.118.1.29`、`202.118.1.53` | 均直连 |
 | 其他域名 | Cloudflare `1.1.1.1` 和 Google `8.8.8.8` DoH | 随 `连接方式` 经 VPS |
 | 节点 DNS 引导 | IPv6 阿里 DNS | 两节点以 IP 拨号，TLS 单独用 SNI，正常情况下节点建连不需要 DNS |
 
 上游自身用 IPv4 还是 IPv6，与它返回 A 或 AAAA 无关。`ipv6: true` 和 `dns.ipv6: true` 同时保留两类记录。外出只有 IPv4 连通时，节点组选 IPv4，国内 DoH 可以经 IPv4 隧道工作；校园 DNS 不可达时学校内网域名或门户的访问仍受物理网络限制。
 
-系统 DNS 的 UDP/TCP 53 劫持受实际 TUN 设置影响。浏览器安全 DNS、Android 私人 DNS、应用自身的 DoH/DoT 都可能绕过 Mihomo 的 DNS 策略。做验收时先关闭这些应用级 DNS 覆盖，再单独开启观察。 [Mihomo DNS 配置](https://wiki.metacubex.one/config/dns/)
+检查实际订阅中三条学校 DNS 策略都排在 `geosite:cn,private` 之前。公开登录域名使用更具体的 `+.` 策略，在 3x-ui 按键名排序导出后仍可优先匹配。系统 DNS 的 UDP/TCP 53 劫持受实际 TUN 设置影响。浏览器安全 DNS、Android 私人 DNS、应用自身的 DoH/DoT 都可能绕过 Mihomo 的 DNS 策略。做验收时先关闭这些应用级 DNS 覆盖，再单独开启观察。 [Mihomo DNS 配置](https://wiki.metacubex.one/config/dns/)
 
 ### 7.3 面板生成的节点应长什么样
 
@@ -561,6 +568,7 @@ sudo tcpdump -ni any -c 24 'udp port 49606'
 - 恰有需要的两条 `type: hysteria2` 节点。`server` 是公网字面量，`sni` 与对应证书域名相同，端口 49606、ALPN 为 h3，证书验证开启。
 - 只有一个主要可见的 `连接方式` 代理组，两个子组分别能按前缀匹配到相应节点。
 - `dns.enhanced-mode` 为 `redir-host`，`tun.route-exclude-address` 仅有两个新端点，`rules` 同时包含两个 TCP 15087 的前置例外。
+- 保留校园网配置时，确认实际订阅中的学校 `DOMAIN-SUFFIX` 直连规则位于所有 TUN 分流规则之前。启用 TUN 后打开 WebVPN，检查 Mihomo 连接日志中 WebVPN 和 SSO 域名都命中 `DIRECT`。
 - 若更新后导出不给新规则，先核对保存的是 Clash 全局规则并使用正确的订阅路径；按面板提示重载服务后再次下载。服务器导出正确、本机少规则时，更新已选中的配置并排查客户端全局扩展。
 - Windows 可用核心做静态检查。订阅文件放在私人目录，`-d` 指向包含 GeoIP/GeoSite 文件的验证目录。此操作不启动 TUN。
 
